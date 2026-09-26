@@ -219,6 +219,22 @@ const ICON_DOWNSCALE = process.env.PREVIEW_ICON_DOWNSCALE !== '0';
 const ICON_SUPERSAMPLE = Number(process.env.PREVIEW_ICON_SUPERSAMPLE ?? 4) || 4;
 // Below this the cap costs a rescale to save nothing worth having.
 const MIN_ICON_CAP_PX = 32;
+/**
+ * Hard ceiling on an icon's decoded resolution, whatever the zoom asks for.
+ *
+ * Without it the cap is unbounded above and a small blueprint resolves to
+ * native: a lone 1x1 building is drawn at 400px (tileSize = masterSize / 3),
+ * which at supersample 4 asks for 1600px — more than any icon in the set. A
+ * worker that keeps the most detailed resolution each icon was ever asked for
+ * would then drift back to holding the catalogue at native size, which is the
+ * ~419MB this is all trying to avoid; it would just take a while to get there.
+ *
+ * With the ceiling the resident set is bounded by the code rather than by how
+ * often the RSS recycle happens to fire. 384 rather than 256 because a lone
+ * 1x1 building is drawn at 400px, so 384 is a 1.04x upscale (invisible) where
+ * 256 would be 1.56x (visibly soft on a small blueprint's preview).
+ */
+const MAX_ICON_CAP_PX = Number(process.env.PREVIEW_ICON_MAX_CAP ?? 384) || 384;
 
 /**
  * The resolution each flat icon is currently resident at, so a later render
@@ -229,6 +245,28 @@ const MIN_ICON_CAP_PX = 32;
  */
 const decodedIconCap = new Map<string, number>();
 
+// PROTOTYPE (investigation only, not a shipping feature): a directory of
+// pre-scaled icon tiers, `<root>/<tier>/<name>.png`. Downscaling at decode
+// time caps what is *retained*, but libpng still expands every icon to native
+// size first, so peak RSS is unchanged — and peak is what a 512MB container
+// dies on. Reading an already-small file is the only way to never allocate
+// the big one. This hook exists to measure whether that is worth building
+// into the import pipeline.
+const ICON_VARIANT_ROOT = process.env.PREVIEW_ICON_VARIANT_ROOT;
+const ICON_VARIANT_TIERS = (process.env.PREVIEW_ICON_VARIANT_TIERS ?? "64,128,256").split(",").map(Number);
+
+function resolveIconFile(baseDir: string, imageUrl: string, cap: number): string {
+  const nativePath = path.join(baseDir, imageUrl);
+  if (!ICON_VARIANT_ROOT || !Number.isFinite(cap)) return nativePath;
+  const match = /(?:^|[\\/])ui_image[\\/](.+\.png)$/i.exec(imageUrl);
+  if (!match) return nativePath;
+  // Smallest tier that still satisfies the cap; none means native.
+  const tier = ICON_VARIANT_TIERS.find(t => t >= cap);
+  if (tier == null) return nativePath;
+  const candidate = path.join(ICON_VARIANT_ROOT, String(tier), match[1]);
+  return fs.existsSync(candidate) ? candidate : nativePath;
+}
+
 // Decode the given textures if they are not already resident. Missing or
 // unregistered files get a 1x1 transparent placeholder instead of failing the
 // whole render: node PIXI cannot load textures lazily (sync getBaseTexture),
@@ -238,8 +276,12 @@ async function ensureTextures(
   pixi: PixiNodeUtil,
   baseDir: string,
   collected: CollectedImages,
-  tileSizePx: number
+  tileSizePx: number,
+  masterSizePx: number
 ): Promise<number> {
+  // Framing fits the content, so nothing is ever drawn larger than the master
+  // itself — resolution beyond that cannot reach the output under any zoom.
+  const ceiling = Math.min(MAX_ICON_CAP_PX, masterSizePx);
   let missing = 0;
   for (const key of collected.ids) {
     const cells = ICON_DOWNSCALE ? collected.flatIconCells.get(key) : undefined;
@@ -247,7 +289,10 @@ async function ensureTextures(
     const cap =
       cells == null
         ? Infinity
-        : Math.max(MIN_ICON_CAP_PX, Math.ceil(cells * tileSizePx * ICON_SUPERSAMPLE));
+        : Math.min(
+            ceiling,
+            Math.max(MIN_ICON_CAP_PX, Math.ceil(cells * tileSizePx * ICON_SUPERSAMPLE))
+          );
     if (ImageSource.isTextureLoaded(key)) {
       // Resident and at least as detailed as this render needs.
       if ((decodedIconCap.get(key) ?? Infinity) >= cap) continue;
@@ -255,7 +300,7 @@ async function ensureTextures(
     try {
       const imageUrl = ImageSource.getUrl(key)!;
       const { baseTexture, nativeMaxDim } = await pixi.decodeToBaseTexture(
-        path.join(baseDir, imageUrl),
+        resolveIconFile(baseDir, imageUrl, cap),
         Number.isFinite(cap) ? cap : undefined
       );
       ImageSource.setBaseTexture(key, baseTexture);
@@ -529,7 +574,7 @@ async function renderMaster(
   const texturesStart = Date.now();
   sampleRss();
   mem.afterImport = memSample();
-  await ensureTextures(pixi, assetBaseDir, collectImageIds(blueprint), tileSize);
+  await ensureTextures(pixi, assetBaseDir, collectImageIds(blueprint), tileSize, size);
 
   const rasterizeStart = Date.now();
   sampleRss();
@@ -718,10 +763,11 @@ const SMOKE_FIXTURE: MdbBlueprint = {
 async function runSmokeTest(pixi: PixiNodeUtil, assetBaseDir: string) {
   const blueprint = new SharedBlueprint();
   blueprint.importFromMdb(SMOKE_FIXTURE);
-  // Uncapped: this call is asking whether every fixture texture exists on
-  // disk, not what resolution it should be held at. renderMaster below applies
-  // the real cap, and a native-size decode is never re-fetched for one.
-  const missing = await ensureTextures(pixi, assetBaseDir, collectImageIds(blueprint), Infinity);
+  // Infinite tile size, so every flat icon lands on the ceiling: this call is
+  // asking whether the fixture's textures exist on disk, not what resolution
+  // they should be held at, and the ceiling is the most renderMaster below can
+  // ask for anyway.
+  const missing = await ensureTextures(pixi, assetBaseDir, collectImageIds(blueprint), Infinity, 1200);
   if (missing > 0) throw new Error(`smoke: ${missing} fixture textures missing from asset root`);
 
   const { raw, width, height } = await renderMaster(pixi, assetBaseDir, SMOKE_FIXTURE, 1200);
