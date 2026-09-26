@@ -24,6 +24,11 @@
 /assets/database/database-2024.zip
 /frontend/src/assets/database/database-2024.zip
 
+# Pre-scaled preview icon tiers: a build derivative of assets/ui_image, produced
+# by `npm run icon-variants` (and by import:2024 / the deploy image build), not a
+# committed asset. See app/api/services/render-memory.ts.
+/assets/ui_image_preview/
+
 # Graphify knowledge-graph build artifacts (AI coding aid, not source)
 /graphify-out
 # Server-rendered blueprint preview image cache (regenerated on demand)

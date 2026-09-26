@@ -52,6 +52,13 @@ RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 RUN npm rebuild canvas && node -e "require('canvas')"
 COPY --from=build-backend /bpni/build /bpni/build
 COPY --from=build-frontend /bpni/build/app/public /bpni/build/app/public
+# Pre-scaled flat-icon tiers for the preview renderer. Generated here rather
+# than committed: they are a derivative of the ui_image the frontend build just
+# brought in, only the render worker reads them, and committing ~68MB of
+# regenerable PNGs would churn git on every asset import. Must come after both
+# COPYs above — it reads app/public/assets/ui_image and writes
+# build/assets/ui_image_preview. sharp resolves from /bpni/node_modules.
+RUN cd /bpni/build && node app/api/batch/generate-icon-variants.js
 # Migrations run from the deploy console (cd /bpni/build && npm run migrate:up);
 # migrate-mongo resolves its config and migrationsDir relative to cwd, so both
 # must ship inside the runtime image.

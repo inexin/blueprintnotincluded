@@ -35,6 +35,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { generateIconVariants } from './generate-icon-variants';
 import { createCanvas, Image } from 'canvas';
 import {
   BBuildingFile2024,
@@ -489,7 +490,7 @@ function writeEnglishStrings(strings: Record<string, string>, outBase: string): 
   console.log('---', changed ? 'wrote' : 'unchanged', path.normalize(stringsTarget), '---');
 }
 
-export function convertExport2024(opts: ConvertOptions): void {
+export async function convertExport2024(opts: ConvertOptions): Promise<void> {
   const dbDir = path.join(opts.exportDir, 'database');
   const uiImageDir = path.join(opts.exportDir, 'ui_image');
   const connectionDir = path.join(opts.exportDir, 'connection_sprites');
@@ -1094,6 +1095,13 @@ export function convertExport2024(opts: ConvertOptions): void {
   // ui_image_facade/ is intentionally NOT synced: 988 facade/permit PNGs that no
   // current code path references. To enable, add a syncAssetDir call for
   // path.join(opts.exportDir, 'ui_image_facade') -> assets/ui_image_facade (+ frontend).
+
+  // Pre-scaled icon tiers for the preview renderer, derived from the ui_image
+  // just synced above. Gitignored build output, not a committed asset — but it
+  // is regenerated here so a dev checkout never renders previews against tiers
+  // that belong to an older export. Idempotent, so an import that changed no
+  // icons leaves it untouched.
+  await generateIconVariants();
 }
 
 function normalizeDlcIds(raw: string[] | string | null | undefined): string[] {
@@ -1458,5 +1466,8 @@ function buildingRecord(
 }
 
 if (require.main === module) {
-  convertExport2024(parseArgs(process.argv.slice(2)));
+  convertExport2024(parseArgs(process.argv.slice(2))).catch(err => {
+    console.error('import failed:', err);
+    process.exit(1);
+  });
 }

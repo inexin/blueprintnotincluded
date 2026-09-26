@@ -94,6 +94,16 @@ run the single repeatable step:
   report. Exits non-zero if the import is incomplete (missing icons, incomplete connection
   dirs, `po_string.json` absent, etc.).
 - `npm run import:2024:dry-run` - Validate + report counts only; writes/copies nothing.
+- `npm run icon-variants` / `icon-variants:dry-run` - Generate the pre-scaled flat-icon
+  tiers (64/128/256/384 px) the preview render worker reads, into the **gitignored**
+  `assets/ui_image_preview/<tier>/`. Run automatically at the end of `import:2024`, and in
+  the deploy image build (`deploy.Dockerfile`), so it is never committed. A tier holds only
+  the icons it actually shrinks; the worker falls back to the native PNG for anything else,
+  and for a missing directory entirely — so this is an optimization, never a dependency.
+  Worth ~75MB of the render worker's peak RSS: the icons are authored at print resolution
+  (~419MB of RGBA across 1,369 files) while a preview draws a building into a few tens of
+  pixels, and decoding a native PNG allocates the full bitmap whatever it is scaled to
+  afterwards.
 - The committed runtime DB artifact is the loose `database-2024.json` (readable diffs).
   The `database-2024.zip` (both roots) is a **gitignored** build derivative: the backend
   reads the JSON directly, the frontend regenerates the zip from it via `prebuild`/

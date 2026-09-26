@@ -51,7 +51,11 @@ import {
 } from '../../../lib';
 import { PixiNodeUtil } from '../pixi-node-util';
 import { startMemoryHeartbeat } from './memory-heartbeat';
-import { resolveMaxRssMb } from './render-memory';
+import {
+  resolveMaxRssMb,
+  ICON_VARIANT_TIERS,
+  ICON_VARIANT_DIRNAME,
+} from './render-memory';
 
 const REPO_ROOT = path.resolve(__dirname, '../../..');
 
@@ -251,24 +255,40 @@ const MAX_ICON_CAP_PX = Number(process.env.PREVIEW_ICON_MAX_CAP ?? 384) || 384;
  */
 const decodedIconCap = new Map<string, number>();
 
-// PROTOTYPE (investigation only, not a shipping feature): a directory of
-// pre-scaled icon tiers, `<root>/<tier>/<name>.png`. Downscaling at decode
-// time caps what is *retained*, but libpng still expands every icon to native
-// size first, so peak RSS is unchanged — and peak is what a 512MB container
-// dies on. Reading an already-small file is the only way to never allocate
-// the big one. This hook exists to measure whether that is worth building
-// into the import pipeline.
-const ICON_VARIANT_ROOT = process.env.PREVIEW_ICON_VARIANT_ROOT;
-const ICON_VARIANT_TIERS = (process.env.PREVIEW_ICON_VARIANT_TIERS ?? "64,128,256").split(",").map(Number);
+/**
+ * Pre-scaled icon tiers written by `npm run icon-variants`
+ * (app/api/batch/generate-icon-variants.ts), at
+ * `<repo>/assets/ui_image_preview/<tier>/<name>.png`.
+ *
+ * Decode-time downscaling caps what a render *retains*, but libpng expands
+ * every icon to native size on the way there, so it leaves peak RSS alone —
+ * and peak is what a 512MB container dies on. Reading an already-small file is
+ * the only way to never allocate the big one: on the 8,612-item blueprint this
+ * is worth ~75MB of peak RSS and halves the decode.
+ *
+ * Absent — a checkout that has not run the generator, an image built before it
+ * existed — every lookup falls through to the native file, so this is an
+ * optimization and never a dependency.
+ */
+const ICON_VARIANT_ROOT =
+  process.env.PREVIEW_ICON_VARIANT_ROOT ?? path.join(REPO_ROOT, 'assets', ICON_VARIANT_DIRNAME);
+
+// `assets/ui_image/<name>.png` -> `<name>.png`, and nothing else. Atlas images
+// live elsewhere and must never be served a scaled file: their sprites are
+// addressed by pixel rectangles that scaling would invalidate.
+const UI_IMAGE_PATH = /(?:^|[\\/])ui_image[\\/](.+\.png)$/i;
 
 function resolveIconFile(baseDir: string, imageUrl: string, cap: number): string {
   const nativePath = path.join(baseDir, imageUrl);
-  if (!ICON_VARIANT_ROOT || !Number.isFinite(cap)) return nativePath;
-  const match = /(?:^|[\\/])ui_image[\\/](.+\.png)$/i.exec(imageUrl);
-  if (!match) return nativePath;
-  // Smallest tier that still satisfies the cap; none means native.
+  if (!Number.isFinite(cap)) return nativePath;
+  const match = UI_IMAGE_PATH.exec(imageUrl);
+  if (match == null) return nativePath;
+  // Smallest tier that still holds every pixel this render can display. No
+  // such tier means the cap is above the largest one, so native it is.
   const tier = ICON_VARIANT_TIERS.find(t => t >= cap);
   if (tier == null) return nativePath;
+  // A tier omits icons it would not actually shrink, so a miss here is normal
+  // and means the native file is already small enough.
   const candidate = path.join(ICON_VARIANT_ROOT, String(tier), match[1]);
   return fs.existsSync(candidate) ? candidate : nativePath;
 }
