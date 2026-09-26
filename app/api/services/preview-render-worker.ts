@@ -206,9 +206,15 @@ function collectImageIds(blueprint: SharedBlueprint): CollectedImages {
 // whole render: node PIXI cannot load textures lazily (sync getBaseTexture),
 // and a handful of legacy ui sprites may be absent without affecting
 // blueprint rendering. Returns the number of placeholders used.
+// Whether the rasterize loop may collect between batches. Requires the worker
+// to have been forked with --expose-gc; without it global.gc is undefined and
+// this stays off, which is the historical behaviour.
+const GC_BETWEEN_BATCHES =
+  typeof global.gc === 'function' && process.env.PREVIEW_GC_BETWEEN_BATCHES !== '0';
+
 // Items drawn per rasterize batch. 0 renders the whole blueprint in one pass,
 // which is what this did before batching existed.
-const RASTER_CHUNK_SIZE = Number(process.env.PREVIEW_RASTER_CHUNK ?? 250);
+const RASTER_CHUNK_SIZE = Number(process.env.PREVIEW_RASTER_CHUNK ?? 100);
 
 // Off with PREVIEW_ICON_DOWNSCALE=0, which restores native-resolution decodes.
 const ICON_DOWNSCALE = process.env.PREVIEW_ICON_DOWNSCALE !== '0';
@@ -676,6 +682,15 @@ async function renderMaster(
     // reference — blueprint.blueprintItems was emptied once the draw order
     // was taken.
     ordered.fill(null as any, offset, offset + chunk.length);
+
+    // Collect between batches when the flag allows it. Dropping the
+    // references above makes the batch collectable, but nothing forces a
+    // collection, so the rasterize phase otherwise carries hundreds of
+    // batches' worth of garbage to its peak — which is what the heap ceiling
+    // measures. Batching alone plateaus around 70MB here; this is what takes
+    // it lower. It costs a full GC pause per batch, so it is opt-in via
+    // --expose-gc rather than something every render pays for.
+    if (GC_BETWEEN_BATCHES) global.gc!();
   }
 
   // Everything that belongs above the buildings, in one final pass: ports

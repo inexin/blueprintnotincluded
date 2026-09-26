@@ -737,6 +737,15 @@ export class PreviewImageService {
       execArgv: [
         ...(isTs ? ['-r', 'ts-node/register/transpile-only'] : []),
         `--max-old-space-size=${maxOldSpaceMb}`,
+        // Lets the worker collect between rasterize batches. Dropping a
+        // batch's references makes it collectable but forces no collection,
+        // so without this the rasterize phase carries every batch's garbage
+        // to its peak: 146MB of heap becomes 178MB, and peak RSS 339MB
+        // becomes 368MB. It buys that back with a GC pause per batch —
+        // deliberate, since a render that finishes slowly beats one that
+        // aborts. PREVIEW_GC_BETWEEN_BATCHES=0 turns the behaviour off
+        // without removing the flag.
+        '--expose-gc',
       ],
       env: { ...process.env, TS_NODE_TRANSPILE_ONLY: '1' },
       stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
