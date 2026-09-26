@@ -206,6 +206,10 @@ function collectImageIds(blueprint: SharedBlueprint): CollectedImages {
 // whole render: node PIXI cannot load textures lazily (sync getBaseTexture),
 // and a handful of legacy ui sprites may be absent without affecting
 // blueprint rendering. Returns the number of placeholders used.
+// Items drawn per rasterize batch. 0 renders the whole blueprint in one pass,
+// which is what this did before batching existed.
+const RASTER_CHUNK_SIZE = Number(process.env.PREVIEW_RASTER_CHUNK ?? 250);
+
 // Off with PREVIEW_ICON_DOWNSCALE=0, which restores native-resolution decodes.
 const ICON_DOWNSCALE = process.env.PREVIEW_ICON_DOWNSCALE !== '0';
 // Cells are drawn at `tileSize` px, so an icon's useful resolution is its
@@ -546,19 +550,98 @@ async function renderMaster(
   exportCamera.cameraOffset = cameraOffset;
   exportCamera.overlay = Overlay.Base;
   exportCamera.display = Display.solid;
-  exportCamera.container = pixi.getNewContainer();
-  exportCamera.container.sortableChildren = true;
-
-  blueprint.blueprintItems.map(item => {
-    item.updateTileables(blueprint);
-    item.drawPixi(exportCamera, pixi);
-  });
-  await drawTerrainFeatures(pixi, assetBaseDir, blueprint, exportCamera);
-  await drawWorldNotes(pixi, assetBaseDir, blueprint, exportCamera);
-
   const baseRenderTexture = pixi.getNewBaseRenderTexture({ width: size, height: size });
   const renderTexture = pixi.getNewRenderTexture(baseRenderTexture);
-  pixi.pixiApp.renderer.render(exportCamera.container, renderTexture, false);
+
+  // Tileables first, for every item: updateTileables inspects an item's
+  // neighbours, so it cannot be interleaved with a draw order that only has
+  // part of the blueprint in hand.
+  blueprint.blueprintItems.forEach(item => item.updateTileables(blueprint));
+  // Then depth, which drawPixi would otherwise resolve lazily per item — it
+  // has to be known up front because it is what the draw order sorts on.
+  blueprint.blueprintItems.forEach(item => item.cameraChanged(exportCamera));
+
+  // Rasterize in depth-ordered batches, compositing each into the same render
+  // texture and destroying it before building the next.
+  //
+  // One container for the whole blueprint meant every item's PIXI display
+  // objects had to be live simultaneously: ~35KB an item on a real base
+  // (several drawParts each — tileable variants, connection sprites, port
+  // sprites), so 8,612 items is ~300MB of JS heap against a 256MB ceiling,
+  // and the worker aborts with "Reached heap limit" rather than failing.
+  // Batching makes the live set a function of the batch, not the blueprint.
+  //
+  // Correctness rests on the sort: with items in ascending depth and batches
+  // composited in order, the painter's result is what one sorted container
+  // produced. Items of equal depth keep their relative order across a batch
+  // boundary too, because an earlier batch is always drawn first.
+  const ordered = [...blueprint.blueprintItems].sort((a, b) => a.depth - b.depth);
+  const chunkSize = RASTER_CHUNK_SIZE > 0 ? RASTER_CHUNK_SIZE : ordered.length;
+  // `ordered` is now the only handle on the items, so a drawn batch can be
+  // released. Nothing below reads blueprintItems — the bounding box is already
+  // resolved, and the terrain/note passes work off their own arrays.
+  blueprint.blueprintItems = [];
+
+  // Utility ports are added to the *camera* container at zIndex 200, above
+  // every building, so they cannot be composited with the batch that created
+  // them — a later batch's buildings would paint over them. They are lifted
+  // out of each batch and drawn in the overlay pass below.
+  const utilityLayer = pixi.getNewContainer();
+  utilityLayer.sortableChildren = true;
+  utilityLayer.zIndex = 200;
+
+  for (let offset = 0; offset < ordered.length; offset += chunkSize) {
+    const chunk = ordered.slice(offset, offset + chunkSize);
+    const chunkContainer = pixi.getNewContainer();
+    chunkContainer.sortableChildren = true;
+    exportCamera.container = chunkContainer;
+
+    for (const item of chunk) item.drawPixi(exportCamera, pixi);
+    // addChild re-parents, so this both rescues the sprites and takes them out
+    // of the batch that is about to be destroyed.
+    for (const item of chunk)
+      for (const sprite of item.utilitySprites ?? []) if (sprite != null) utilityLayer.addChild(sprite);
+
+    pixi.pixiApp.renderer.render(chunkContainer, renderTexture, false);
+    // texture/baseTexture default to false here, so the shared decoded
+    // textures survive; only this batch's display objects go.
+    chunkContainer.destroy({ children: true });
+
+    // Destroying the container is not enough on its own: a destroyed PIXI
+    // object is still a live JS object, and every one of them is still
+    // reachable from the item that made it (item.container,
+    // drawPart.sprite). Until those references go, nothing is collected and
+    // batching saves exactly nothing — which is what the first attempt at
+    // this measured. Dropping them is what makes the batch's memory
+    // recoverable.
+    for (const item of chunk) {
+      // Already re-parented into utilityLayer, and item.destroy() would
+      // destroy them out from under the overlay pass.
+      item.utilitySprites = [];
+      item.destroy();
+      for (const part of item.drawParts) {
+        part.sprite = null;
+        part.isReady = false;
+      }
+      // The imported graph is per-item too (~4KB each) and nothing reads it
+      // after the item is drawn.
+      item.drawParts.length = 0;
+    }
+    // Release the batch's items themselves. `ordered` is the only remaining
+    // reference — blueprint.blueprintItems was emptied once the draw order
+    // was taken.
+    ordered.fill(null as any, offset, offset + chunk.length);
+  }
+
+  // Everything that belongs above the buildings, in one final pass: ports
+  // (200), terrain annotations (5e5), then world notes (1e6).
+  const overlayContainer = pixi.getNewContainer();
+  overlayContainer.sortableChildren = true;
+  exportCamera.container = overlayContainer;
+  overlayContainer.addChild(utilityLayer);
+  await drawTerrainFeatures(pixi, assetBaseDir, blueprint, exportCamera);
+  await drawWorldNotes(pixi, assetBaseDir, blueprint, exportCamera);
+  pixi.pixiApp.renderer.render(overlayContainer, renderTexture, false);
 
   // Raw RGBA straight out of getImageData (non-premultiplied): no PNG encode.
   // The old toDataURL path (full zlib encode + base64 + JSON IPC + re-decode
@@ -576,6 +659,8 @@ async function renderMaster(
   sampleRss();
   mem.afterExtract = memSample();
 
+  // Each batch destroyed itself as it was composited; this is the overlay
+  // pass, which is all that is still standing.
   exportCamera.container.destroy({ children: true });
   baseRenderTexture.destroy();
   renderTexture.destroy();
