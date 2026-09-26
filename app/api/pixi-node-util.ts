@@ -1,4 +1,4 @@
-const { loadImage } = require('canvas');
+const { loadImage, createCanvas } = require('canvas');
 const PIXI = require('../pixi-shim');
 require('../pixi-shim/lib/pixi-shim-node.js');
 
@@ -81,11 +81,53 @@ export class PixiNodeUtil implements PixiUtil {
     }
   }
 
-  async getImageFromCanvas(path: string) {
-    let image = await loadImage(path);
-    let ressource = new NodeCanvasResource(image);
-    let bt = new PIXI.BaseTexture(ressource);
-    return bt;
+  /**
+   * Decode an image into a BaseTexture, optionally capping its longest side.
+   *
+   * The cap exists because the art is authored at print resolution while a
+   * preview draws a building into a few tens of pixels: assets/ui_image is
+   * 1,369 icons totalling ~419MB of RGBA at native size, and a render that
+   * touches most of the catalogue pays all of it. The full-size bitmap is
+   * still decoded here — libpng gives no way to scale while decoding — but it
+   * is transient, and only the downscaled canvas is retained by the texture.
+   *
+   * Only safe for textures drawn whole. An atlas must never be capped: its
+   * sprites are addressed by pixel rectangles (SpriteInfo.uvMin/uvSize), which
+   * scaling silently invalidates.
+   */
+  async getImageFromCanvas(path: string, maxDimension?: number) {
+    return (await this.decodeToBaseTexture(path, maxDimension)).baseTexture;
+  }
+
+  /**
+   * As getImageFromCanvas, but also reports the image's native longest side.
+   * A caller that caches by resolution needs it: without it, an icon whose
+   * native size is already under the cap is indistinguishable from one that
+   * was downscaled to exactly the cap, and every later render asking for more
+   * detail re-decodes it to get the same pixels back.
+   */
+  async decodeToBaseTexture(
+    path: string,
+    maxDimension?: number
+  ): Promise<{ baseTexture: any; nativeMaxDim: number }> {
+    const image = await loadImage(path);
+    const nativeMaxDim = Math.max(image.width, image.height);
+    let source: any = image;
+    if (maxDimension != null && nativeMaxDim > maxDimension) {
+      const scale = maxDimension / nativeMaxDim;
+      const width = Math.max(1, Math.round(image.width * scale));
+      const height = Math.max(1, Math.round(image.height * scale));
+      const canvas = createCanvas(width, height);
+      const context = canvas.getContext('2d');
+      // The icons are alpha-cut art on transparency; without this the
+      // downscale fringes every edge against the uninitialised backdrop.
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
+      context.drawImage(image, 0, 0, width, height);
+      source = canvas;
+    }
+    const ressource = new NodeCanvasResource(source);
+    return { baseTexture: new PIXI.BaseTexture(ressource), nativeMaxDim };
   }
 
   async getImageWhite(path: string) {

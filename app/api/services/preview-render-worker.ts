@@ -116,6 +116,27 @@ function memSample(): MemSample {
   };
 }
 
+/**
+ * Bytes currently held by decoded textures, counted from the textures
+ * themselves rather than inferred from RSS.
+ *
+ * RSS cannot answer this. Every decode goes through libpng at native size
+ * even when only a downscaled copy is retained, and a native allocator does
+ * not return freed blocks to the OS — so peak RSS records the transient
+ * full-size decodes whether or not anything keeps them. This counts what the
+ * worker is actually still holding.
+ */
+function residentTextureMb(pixi: PixiNodeUtil): number {
+  let bytes = 0;
+  for (const key of ImageSource.keys) {
+    if (!ImageSource.isTextureLoaded(key)) continue;
+    const baseTexture = ImageSource.getBaseTexture(key, pixi);
+    if (baseTexture?.width && baseTexture?.height)
+      bytes += baseTexture.width * baseTexture.height * 4;
+  }
+  return Math.round(bytes / MB);
+}
+
 // Diagnostic only, off unless PREVIEW_WORKER_HEAP_SNAPSHOT_DIR is set: a
 // snapshot is hundreds of MB and stops the world to write. Set it to attribute
 // a render's heap to constructors (which is the scene graph, which is the
@@ -141,26 +162,68 @@ async function writeHeapSnapshot(phase: string, label: string): Promise<void> {
 // texture consumers (DrawPart.prepareSprite, SpriteInfo.getTexture,
 // drawPixiUtility) so only these files are decoded — preloading the full
 // registered set costs ~400MB RSS and OOM-kills small prod instances.
-function collectImageIds(blueprint: SharedBlueprint): Set<string> {
-  const imageIds = new Set<string>();
+interface CollectedImages {
+  /** Every image id this render can request. */
+  ids: Set<string>;
+  /**
+   * For flat icons only: the largest footprint, in cells, that any item draws
+   * this icon into. Multiplied by the render's cell pitch it gives the only
+   * resolution the icon can actually show, which is what caps the decode.
+   *
+   * Atlas images are deliberately absent. Their sprites are addressed by pixel
+   * rectangles (SpriteInfo.uvMin/uvSize) that scaling would silently
+   * invalidate, so they are always decoded at native size.
+   */
+  flatIconCells: Map<string, number>;
+}
+
+function collectImageIds(blueprint: SharedBlueprint): CollectedImages {
+  const ids = new Set<string>();
+  const flatIconCells = new Map<string, number>();
   for (const item of blueprint.blueprintItems) {
+    const cells = Math.max(item.oniItem.size?.x ?? 1, item.oniItem.size?.y ?? 1, 1);
     for (const part of item.drawParts) {
       if (part.flatIconId) {
-        imageIds.add(part.flatIconId);
+        ids.add(part.flatIconId);
+        flatIconCells.set(part.flatIconId, Math.max(flatIconCells.get(part.flatIconId) ?? 0, cells));
       } else if (part.spriteModifier) {
         const spriteInfo = SpriteInfo.getSpriteInfo(part.spriteModifier.spriteInfoName);
-        if (spriteInfo?.imageId) imageIds.add(spriteInfo.imageId);
+        if (spriteInfo?.imageId) ids.add(spriteInfo.imageId);
       }
     }
     for (const connection of item.oniItem.utilityConnections ?? []) {
       const connectionSprite = ConnectionHelper.getConnectionSprite(connection);
       const spriteInfo =
         connectionSprite && SpriteInfo.getSpriteInfo(connectionSprite.spriteInfoId);
-      if (spriteInfo?.imageId) imageIds.add(spriteInfo.imageId);
+      if (spriteInfo?.imageId) ids.add(spriteInfo.imageId);
     }
   }
-  return imageIds;
+  return { ids, flatIconCells };
 }
+
+// Decode the given textures if they are not already resident. Missing or
+// unregistered files get a 1x1 transparent placeholder instead of failing the
+// whole render: node PIXI cannot load textures lazily (sync getBaseTexture),
+// and a handful of legacy ui sprites may be absent without affecting
+// blueprint rendering. Returns the number of placeholders used.
+// Off with PREVIEW_ICON_DOWNSCALE=0, which restores native-resolution decodes.
+const ICON_DOWNSCALE = process.env.PREVIEW_ICON_DOWNSCALE !== '0';
+// Cells are drawn at `tileSize` px, so an icon's useful resolution is its
+// footprint times that. The margin covers the art that legitimately overhangs
+// its footprint (uiImageRect placement, connection-sprite caps) and leaves a
+// little headroom so the cap never becomes the visible limit on quality.
+const ICON_SUPERSAMPLE = Number(process.env.PREVIEW_ICON_SUPERSAMPLE ?? 4) || 4;
+// Below this the cap costs a rescale to save nothing worth having.
+const MIN_ICON_CAP_PX = 32;
+
+/**
+ * The resolution each flat icon is currently resident at, so a later render
+ * needing more detail than an earlier one settled for re-decodes instead of
+ * drawing a blurred cache hit. An icon decoded at its native size records
+ * Infinity — there is no more detail to fetch, and without that distinction a
+ * small icon would re-decode on every render that asked for more than it has.
+ */
+const decodedIconCap = new Map<string, number>();
 
 // Decode the given textures if they are not already resident. Missing or
 // unregistered files get a 1x1 transparent placeholder instead of failing the
@@ -170,18 +233,33 @@ function collectImageIds(blueprint: SharedBlueprint): Set<string> {
 async function ensureTextures(
   pixi: PixiNodeUtil,
   baseDir: string,
-  imageIds: Iterable<string>
+  collected: CollectedImages,
+  tileSizePx: number
 ): Promise<number> {
   let missing = 0;
-  for (const key of imageIds) {
-    if (ImageSource.isTextureLoaded(key)) continue;
+  for (const key of collected.ids) {
+    const cells = ICON_DOWNSCALE ? collected.flatIconCells.get(key) : undefined;
+    // Atlas images (absent from flatIconCells) keep an uncapped decode.
+    const cap =
+      cells == null
+        ? Infinity
+        : Math.max(MIN_ICON_CAP_PX, Math.ceil(cells * tileSizePx * ICON_SUPERSAMPLE));
+    if (ImageSource.isTextureLoaded(key)) {
+      // Resident and at least as detailed as this render needs.
+      if ((decodedIconCap.get(key) ?? Infinity) >= cap) continue;
+    }
     try {
       const imageUrl = ImageSource.getUrl(key)!;
-      const baseTexture = await pixi.getImageFromCanvas(path.join(baseDir, imageUrl));
+      const { baseTexture, nativeMaxDim } = await pixi.decodeToBaseTexture(
+        path.join(baseDir, imageUrl),
+        Number.isFinite(cap) ? cap : undefined
+      );
       ImageSource.setBaseTexture(key, baseTexture);
+      decodedIconCap.set(key, nativeMaxDim <= cap ? Infinity : cap);
     } catch {
       missing++;
       ImageSource.setBaseTexture(key, pixi.getNewBaseRenderTexture({ width: 1, height: 1 }));
+      decodedIconCap.set(key, Infinity);
     }
   }
   if (missing > 0)
@@ -356,6 +434,8 @@ interface RenderTimings {
    * problems with two different fixes.
    */
   mem: MemPhases;
+  /** Decoded-texture bytes the worker still holds after this render. */
+  residentTextureMb: number;
 }
 
 /** One memory reading, in MB. */
@@ -434,22 +514,27 @@ async function renderMaster(
   blueprint.importFromMdb(mdb);
   if (blueprint.blueprintItems.length === 0) throw new Error('empty blueprint');
 
-  const texturesStart = Date.now();
-  sampleRss();
-  mem.afterImport = memSample();
-  await ensureTextures(pixi, assetBaseDir, collectImageIds(blueprint));
-
-  const rasterizeStart = Date.now();
-  sampleRss();
-  mem.afterTextures = memSample();
-  // Baseline snapshot: everything the render needs *before* a single PIXI
-  // display object exists. Differencing it against the rasterize snapshot is
-  // what attributes the scene graph, rather than inferring it from RSS.
-  await writeHeapSnapshot('textures', label);
+  // Framing is resolved before the textures are decoded, not after: the cell
+  // pitch is what says how much resolution an icon can possibly show, and an
+  // icon decoded before that is known can only be decoded at native size.
   const [topLeft, bottomRight] = blueprint.getBoundingBox();
   const totalTileSize = new Vector2(bottomRight.x - topLeft.x + 3, bottomRight.y - topLeft.y + 3);
   const maxTotalSize = Math.max(totalTileSize.x, totalTileSize.y);
   const tileSize = size / maxTotalSize;
+
+  const texturesStart = Date.now();
+  sampleRss();
+  mem.afterImport = memSample();
+  await ensureTextures(pixi, assetBaseDir, collectImageIds(blueprint), tileSize);
+
+  const rasterizeStart = Date.now();
+  sampleRss();
+  mem.afterTextures = memSample();
+  const residentTextures = residentTextureMb(pixi);
+  // Baseline snapshot: everything the render needs *before* a single PIXI
+  // display object exists. Differencing it against the rasterize snapshot is
+  // what attributes the scene graph, rather than inferring it from RSS.
+  await writeHeapSnapshot('textures', label);
   const cameraOffset = new Vector2(-topLeft.x + 1, bottomRight.y + 1);
   if (totalTileSize.x > totalTileSize.y)
     cameraOffset.y += totalTileSize.x / 2 - totalTileSize.y / 2;
@@ -520,6 +605,7 @@ async function renderMaster(
       extractMs: Date.now() - extractStart,
       peakRssMb,
       mem,
+      residentTextureMb: residentTextures,
     },
   };
 }
@@ -547,7 +633,10 @@ const SMOKE_FIXTURE: MdbBlueprint = {
 async function runSmokeTest(pixi: PixiNodeUtil, assetBaseDir: string) {
   const blueprint = new SharedBlueprint();
   blueprint.importFromMdb(SMOKE_FIXTURE);
-  const missing = await ensureTextures(pixi, assetBaseDir, collectImageIds(blueprint));
+  // Uncapped: this call is asking whether every fixture texture exists on
+  // disk, not what resolution it should be held at. renderMaster below applies
+  // the real cap, and a native-size decode is never re-fetched for one.
+  const missing = await ensureTextures(pixi, assetBaseDir, collectImageIds(blueprint), Infinity);
   if (missing > 0) throw new Error(`smoke: ${missing} fixture textures missing from asset root`);
 
   const { raw, width, height } = await renderMaster(pixi, assetBaseDir, SMOKE_FIXTURE, 1200);
@@ -631,7 +720,7 @@ async function main() {
         phases =
           ` import=${timings.importMs}ms textures=${timings.texturesMs}ms` +
           ` rasterize=${timings.rasterizeMs}ms extract=${timings.extractMs}ms` +
-          ` peakRss=${timings.peakRssMb}MB` +
+          ` peakRss=${timings.peakRssMb}MB textures=${timings.residentTextureMb}MB` +
           ` mem[rss/heap/external]MB(start=${m.start.rss}/${m.start.heap}/${m.start.external}` +
           ` +import=${delta(m.afterImport, m.start)}` +
           ` +tex=${delta(m.afterTextures, m.afterImport)}` +
