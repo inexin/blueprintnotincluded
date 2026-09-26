@@ -229,6 +229,27 @@ const ICON_DOWNSCALE = process.env.PREVIEW_ICON_DOWNSCALE !== '0';
 const ICON_SUPERSAMPLE = Number(process.env.PREVIEW_ICON_SUPERSAMPLE ?? 4) || 4;
 // Below this the cap costs a rescale to save nothing worth having.
 const MIN_ICON_CAP_PX = 32;
+// Fewest cells a preview ever frames, which is what bounds the cell pitch:
+// masterSize / MIN_FRAME_CELLS is the largest a cell can be drawn. 6 puts that
+// at 200px for the 1200px master, which is about where the building art runs
+// out (median ~201px of art per cell), so nothing is magnified past its source.
+const MIN_FRAME_CELLS = Number(process.env.PREVIEW_MIN_FRAME_CELLS ?? 6) || 6;
+// Quantise an icon's decoded resolution to the variant tiers instead of to the
+// exact cell pitch, so the same texture serves every blueprint in a tier band.
+//
+// Off by default: measured, it costs and does not pay. The intuition was that
+// a continuous cap makes two blueprints one cell apart want two different
+// textures for the same icon, thrashing the cache once setBaseTexture began
+// honouring replacements. It does not, because the cap only ever ratchets
+// upward — an icon decoded at 384 for a zoomed-in blueprint satisfies every
+// later render, so caps never oscillate and nothing is re-decoded. Snapping
+// only coarsens that ratchet, while doubling resident textures (7MB -> 14MB)
+// and shifting 75% of drawn pixels (mean 1.4/255, from decoding at 64px where
+// 45px was asked for).
+//
+// Kept because it becomes useful alongside an eviction policy, where entries
+// need to be comparable across blueprints rather than each one bespoke.
+const SNAP_CAP_TO_TIER = process.env.PREVIEW_ICON_SNAP_TIERS === '1';
 /**
  * Hard ceiling on an icon's decoded resolution, whatever the zoom asks for.
  *
@@ -312,13 +333,21 @@ async function ensureTextures(
   for (const key of collected.ids) {
     const cells = ICON_DOWNSCALE ? collected.flatIconCells.get(key) : undefined;
     // Atlas images (absent from flatIconCells) keep an uncapped decode.
-    const cap =
+    const exactCap =
       cells == null
         ? Infinity
         : Math.min(
             ceiling,
             Math.max(MIN_ICON_CAP_PX, Math.ceil(cells * tileSizePx * ICON_SUPERSAMPLE))
           );
+    // Snap up to a tier so the resolution an icon is held at comes from a set
+    // of four values rather than from this blueprint's cell pitch. A cap of 45
+    // and a cap of 47 are two different textures that cannot be shared; tier
+    // 64 serves both, and serves them without a rescale, because the tier file
+    // is already that size.
+    const cap = SNAP_CAP_TO_TIER && Number.isFinite(exactCap)
+      ? ICON_VARIANT_TIERS.find(t => t >= exactCap) ?? exactCap
+      : exactCap;
     if (ImageSource.isTextureLoaded(key)) {
       // Resident and at least as detailed as this render needs.
       if ((decodedIconCap.get(key) ?? Infinity) >= cap) continue;
@@ -594,7 +623,18 @@ async function renderMaster(
   // icon decoded before that is known can only be decoded at native size.
   const [topLeft, bottomRight] = blueprint.getBoundingBox();
   const totalTileSize = new Vector2(bottomRight.x - topLeft.x + 3, bottomRight.y - topLeft.y + 3);
-  const maxTotalSize = Math.max(totalTileSize.x, totalTileSize.y);
+  // The frame never shows fewer cells than MIN_FRAME_CELLS, which is the same
+  // thing as never drawing a cell larger than size / MIN_FRAME_CELLS.
+  //
+  // Zoom was derived from the blueprint's extent alone, with no upper bound,
+  // so a small blueprint was magnified past what its art holds: the building
+  // icons carry ~201px per cell at the median, and a 3-cell frame asks for
+  // 400. The result was an upscaled, softer picture than the source PNG. A
+  // floor on the frame caps the pitch instead, and the space it leaves is
+  // filled by the cell grid that is already composited into the transparent
+  // regions — a small build reads as sitting on a board rather than as a
+  // blurred close-up.
+  const maxTotalSize = Math.max(MIN_FRAME_CELLS, totalTileSize.x, totalTileSize.y);
   const tileSize = size / maxTotalSize;
 
   const texturesStart = Date.now();
@@ -610,11 +650,12 @@ async function renderMaster(
   // display object exists. Differencing it against the rasterize snapshot is
   // what attributes the scene graph, rather than inferring it from RSS.
   await writeHeapSnapshot('textures', label);
+  // Centre the content in the (square) frame. Generalises the previous pair of
+  // axis comparisons: when the frame is exactly the longer extent this is the
+  // same offset, and it also handles a frame widened by MIN_FRAME_CELLS.
   const cameraOffset = new Vector2(-topLeft.x + 1, bottomRight.y + 1);
-  if (totalTileSize.x > totalTileSize.y)
-    cameraOffset.y += totalTileSize.x / 2 - totalTileSize.y / 2;
-  if (totalTileSize.y > totalTileSize.x)
-    cameraOffset.x += totalTileSize.y / 2 - totalTileSize.x / 2;
+  cameraOffset.x += (maxTotalSize - totalTileSize.x) / 2;
+  cameraOffset.y += (maxTotalSize - totalTileSize.y) / 2;
 
   const exportCamera = new CameraService(pixi.getNewContainer());
   exportCamera.setHardZoom(tileSize);

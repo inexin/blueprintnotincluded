@@ -50,11 +50,28 @@ export class ImageSource {
 
     if (imageSource == null) return;
 
-    if (imageSource.baseTexture == null) {
-      imageSource.baseTexture = baseTexture;
-      // Any whole-image texture cached below belongs to the previous base.
-      imageSource.wholeTexture = undefined;
-    }
+    if (imageSource.baseTexture === baseTexture) return;
+
+    // Replace, rather than keep the first texture ever set. This used to be
+    // guarded by `if (baseTexture == null)`, so a second call was silently
+    // dropped: a caller re-decoding an image at a higher resolution did the
+    // work and then had the result thrown away, and the image stayed at
+    // whatever size it happened to be loaded at first. The server-side preview
+    // renderer decodes icons at the resolution a blueprint can display, so a
+    // worker that rendered a large blueprint first kept its low-resolution
+    // icons for every later, more zoomed-in one.
+    const previousBase = imageSource.baseTexture;
+    const previousWhole = imageSource.wholeTexture;
+
+    imageSource.baseTexture = baseTexture;
+    // The memo below wraps the outgoing base, so it cannot survive it.
+    imageSource.wholeTexture = undefined;
+
+    // Free the outgoing pair. Safe because nothing else holds them: the memo
+    // is the only Texture made from a base (see getWholeTexture), and callers
+    // replace textures before drawing, never mid-frame.
+    if (previousWhole != null) previousWhole.destroy(false);
+    if (previousBase != null) previousBase.destroy();
   }
 
   // The whole-image Texture for this source, created once.
